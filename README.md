@@ -1,5 +1,5 @@
 # Effect-of-Helicase-Separation-on-GC-Tautomerism
-This repository contains the data and analysis presented in the article entitled "Effect of Helicase Dynamics on Guanine - Cytosine Tautomerism".
+This repository contains the data and analysis presented in the article entitled "Proton Transfer During DNA Strand Separation as a Source of Mutagenic Guanine-Cytosine Tautomers".
 
 ## Molecular dynamics files
 
