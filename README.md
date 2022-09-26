@@ -9,3 +9,8 @@ The following files can be used to reproduce molecular dynamics files in Gromacs
 - min.mdp (minimisation control file)
 - eq500ps_dna.mdp (equilibration NVT control file)
 - md200ps_dna_pull90min.mdp (example SMD control file)
+
+## ML-NEB files
+- long paths, paths longer than 2A separation distance
+- paths, 0-9 ordered in increasing separation distance according to manuscript
+- stacked, calculations on reaction path including stacking interactions
