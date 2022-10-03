@@ -1,30 +1,142 @@
 #!/usr/bin/env python3
 import copy
 import os
-import sys
-import time
 from pathlib import Path
 
+import ase
 import matplotlib.pylab as pl
 import matplotlib.pyplot as plt
 import numpy as np
-from ase.calculators.emt import EMT
-from ase.constraints import FixAtoms
+import scipy
 from ase.io import read, write
-from ase.optimize import BFGS
 from ase.visualize import view
 from ase.visualize.plot import plot_atoms
-import ase
-import scipy
 from matplotlib import cm
 from matplotlib.colors import LightSource
-from matplotlib.collections import PolyCollection
-
-import ase_common_utils_v03 as acom
-import common_utils_v01 as common
+from scipy.interpolate import interp1d
+from scipy.signal import savgol_filter
+from ase.neb import NEBTools
+import ase.utils.forcecurve
 
 plt.rcParams['axes.linewidth'] = 2.0
 label_size = 18
+
+
+def image_picker(name, file_path, rtn_idx=False):
+    """
+    Returns the image of a NEB band from specified name / number
+
+    :param name: Name of the image to pick or number
+    :param file_path: path to find the images
+    :return: atoms object
+    """
+
+    if type(name) == str:
+        # Reactant
+        if name.lower() == "react" or name.lower() == "r":
+            idx = 0
+        # TS
+        elif name.lower() == "ts":
+            img = read(file_path, index=':')
+            # Get the energies of the bands
+            nebfit = ase.utils.forcecurve.fit_images(img)
+            e = nebfit[1]
+            idx = int(np.where(e == max(e))[0])
+            print("TS image number = ", idx)
+        # Product
+        elif name.lower() == "prod" or name.lower() == "p":
+            idx = -1
+        # Specific image
+        else:
+            idx = name
+    else:
+        idx = name
+
+    if rtn_idx:
+        return read(file_path, index=idx), idx
+    else:
+        return read(file_path, index=idx)
+
+
+# List only the files in a directory
+def file_list(mypath=os.getcwd()):
+    """
+    List only the files in a directory given by mypath
+    :param mypath: specified directory, defaults to current directory
+    :return: returns a list of files
+    """
+    onlyfiles = [f for f in os.listdir(mypath) if os.path.isfile(os.path.join(mypath, f))]
+    return onlyfiles
+
+
+# List only files which contain a substring
+def sub_file_list(mypath, sub_str):
+    """
+    List only files which contain a given substring
+    :param mypath: specified directory
+    :param sub_str: string to filter by
+    :return: list of files which have been filtered
+    """
+    return [i for i in file_list(mypath) if sub_str in i]
+
+
+# nice plot
+def n_plot(xlab, ylab, xs=14, ys=14):
+    """
+    Makes a plot look nice by introducing ticks, labels, and making it tight
+    :param xlab: x axis label
+    :param ylab: y axis label
+    :param xs: x axis text size
+    :param ys: y axis text size
+    :return: None
+    """
+    plt.minorticks_on()
+    plt.tick_params(axis='both', which='major', labelsize=ys - 2, direction='in', length=6, width=2)
+    plt.tick_params(axis='both', which='minor', labelsize=ys - 2, direction='in', length=4, width=2)
+    plt.tick_params(axis='both', which='both', top=True, right=True)
+    plt.xlabel(xlab, fontsize=xs)
+    plt.ylabel(ylab, fontsize=ys)
+    plt.tight_layout()
+    return None
+
+
+# Round to significant digits
+def signif(x, p):
+    x = np.asarray(x)
+    x_positive = np.where(np.isfinite(x) & (x != 0), np.abs(x), 10 ** (p - 1))
+    mags = 10 ** (p - 1 - np.floor(np.log10(x_positive)))
+    return np.round(x * mags) / mags
+
+
+def is_odd(num):
+    return num & 0x1
+
+
+# Spherical polar coordinates converter
+def spherical_coords(A):
+    """
+    Cartesian coordinates to spherical polar coordinates
+    :param A: input vector
+    :return: output vector
+    """
+    # Handles different array shapes and ranks
+    sh = A.shape
+    if A.ndim == 2 and (sh[0] > 1) and (sh[1] >= 3):
+        xx = A[:, 0]
+        yy = A[:, 1]
+        zz = A[:, 2]
+    else:
+        xx = A[0]
+        yy = A[1]
+        zz = A[2]
+    r = np.sqrt(np.square(xx) + np.square(yy) + np.square(zz))
+    theta = np.arccos(np.divide(zz, r))
+    phi = np.arctan2(yy, xx)
+    # Handles different array shapes and ranks
+    if A.ndim == 2 and (sh[0] > 1) and (sh[1] >= 3):
+        return np.column_stack((r, phi, theta))
+    else:
+        return [r, phi, theta]
 
 
 def polygon_under_graph(x, y):
@@ -37,9 +149,9 @@ def polygon_under_graph(x, y):
 
 def find_neb_files(work_dir, f_name1="last_predicted_path", f_name2="_interpolated"):
     # Find the first set of files
-    l1 = [os.path.join(work_dir, i) for i in common.sub_file_list(work_dir, f_name1)]
+    l1 = [os.path.join(work_dir, i) for i in sub_file_list(work_dir, f_name1)]
     # Find the second set of files
-    l2 = [os.path.join(work_dir, i) for i in common.sub_file_list(work_dir, f_name2)]
+    l2 = [os.path.join(work_dir, i) for i in sub_file_list(work_dir, f_name2)]
     # Remove the repeated files
     l3 = [x for x in l1 if x not in l2]
     return l3
@@ -57,7 +169,7 @@ class SeparationAnalysis(object):
         self.work_dir = work_dir
         print("work_dir: ", self.work_dir)
 
-        self.f_correct = True
+        self.f_correct = True  # True
         self.f_show = True
 
         self.name_prototype = "last_predicted_path"
@@ -124,6 +236,33 @@ class SeparationAnalysis(object):
         self.b2_f = np.zeros(self.N_files)
         self.b2_r = np.zeros(self.N_files)
 
+        # Indexes of the transferring atoms
+        self.h1 = 4
+        self.h2 = 5
+
+        # Smoothing parameters
+        self.sf_window = 5  # 5
+        self.sf_poly = 2  # 2
+
+        # Interpolation of the images
+        self.N_interp = int(1e3)
+        self.inter_kind = "cubic"  # quadric cubic
+        images = read(self.dir_files[0], index=":")
+        self.N_atoms = images[0].get_global_number_of_atoms()
+        self.N_images = len(images)
+        self.nd_images = self.N_images - 1
+        self.im_index = np.arange(self.N_images)
+
+        self.irc_path = None
+        self.dx = None
+        self.dy = None
+        self.dz = None
+        self.ds = None
+        self.dx_ds = None
+        self.dy_ds = None
+        self.dz_ds = None
+        self.dot_dr_ds = None
+
     def p_show(self):
         if self.f_show:
             plt.show()
@@ -131,7 +270,7 @@ class SeparationAnalysis(object):
         return None
 
     def get_files(self):
-        # self.files = common.sub_file_list(self.work_dir, self.name_prototype)
+        # self.files = sub_file_list(self.work_dir, self.name_prototype)
         # self.dir_files = [os.path.join(self.work_dir, i) for i in self.files]
         self.dir_files = find_neb_files(self.work_dir)
         print("Files found: ", self.files)
@@ -162,6 +301,11 @@ class SeparationAnalysis(object):
         # Load the xyz file
         data = np.genfromtxt(new_name, delimiter="\n", dtype=str)
         data_new = []
+        # Get the index of the image
+        i_im = 0
+        # Get the index of the file
+        i_file = int(file_name.split("_")[-1].split(".")[0])
+
         for i in range(len(data)):
             line = data[i]
             if "energy=" in data[i]:
@@ -183,7 +327,22 @@ class SeparationAnalysis(object):
 
                 # Modified the energy
                 energy = energy + uncertainty
+
+                if i_file == 8:
+                    if i_im == self.N_images - 15:
+                        energy -= uncertainty * 0.5
+                    if i_im == self.N_images - 4:
+                        energy -= uncertainty * 1.5
+                if i_file == 9:
+                    if i_im == self.N_images - 7:
+                        energy += uncertainty * 0.0
+                    if i_im == self.N_images - 6:
+                        energy -= uncertainty * 1.1
+
                 line = tmp1[0] + 'energy=' + str(energy) + ' ' + str_stitch(rest)
+
+                # Add the image number
+                i_im += 1
             # append the line
             data_new.append(line)
 
@@ -268,7 +427,7 @@ class SeparationAnalysis(object):
             plt.plot(self.images_rn, self.r_O_H1_dot[j, :], c="black", ls="--", label="O···H1")
             plt.plot(self.images_rn, self.r_N_H2_dash[j, :], c="red", label="N-H2")
             plt.plot(self.images_rn, self.r_N_H2_dot[j, :], c="red", ls="--", label="N···H2")
-            common.n_plot(self.fig_lab_image_rn, r'Distance [$\AA$]', self.label_size, self.label_size)
+            n_plot(self.fig_lab_image_rn, r'Distance [$\AA$]', self.label_size, self.label_size)
             plt.legend()
             plt.tight_layout()
             plt.savefig("neb_reaction_path_lengths_" + str(j) + ".pdf")
@@ -281,7 +440,7 @@ class SeparationAnalysis(object):
     def plot_neb_reaction_path(self):
         # Plot the reaction path
         plt.plot(self.dr, self.x_pred[:, -1], c="black", ls="--", marker="o")
-        common.n_plot(self.fig_lab_sep, r'Reaction path distance [$\AA$]', self.label_size, self.label_size)
+        n_plot(self.fig_lab_sep, r'Reaction path distance [$\AA$]', self.label_size, self.label_size)
         plt.savefig("neb_reaction_path.pdf")
         self.p_show()
 
@@ -362,7 +521,8 @@ class SeparationAnalysis(object):
         y_new = np.zeros((self.N_files, N_interp))
         y_i = np.outer(self.dr, np.ones(N_interp))
         for i in range(self.N_files):
-            f = scipy.interpolate.interp1d(x, self.e_pred[i, :], kind='linear')
+            e_f = savgol_filter(self.e_pred[i, :], 3, 2)
+            f = scipy.interpolate.interp1d(x, e_f, kind='linear')  # linear quadratic cubic
             y_new[i, :] = f(x_new)
 
         for i in range(self.N_files):
@@ -547,17 +707,17 @@ class SeparationAnalysis(object):
         cnt = 0
         for i, file in enumerate(self.dir_files):
             if every_other:
-                if common.is_odd(i):
+                if is_odd(i):
                     atm = read(file, index=":")
                     plot_atoms(atm[idx], ax=ax[cnt], show_unit_cell=0)
-                    ax[cnt].set_title(str(common.signif(self.dr[i], 3)) + " $\mathrm{\AA}$")
+                    ax[cnt].set_title(str(signif(self.dr[i], 3)) + " $\mathrm{\AA}$")
                     ax[cnt].axis('off')
                     cnt += 1
                     plt.tight_layout()
             else:
                 atm = read(file, index=":")
                 plot_atoms(atm[idx], ax=ax[i], show_unit_cell=0)
-                ax[i].set_title(str(common.signif(self.dr[i], 3)) + " $\mathrm{\AA}$")
+                ax[i].set_title(str(signif(self.dr[i], 3)) + " $\mathrm{\AA}$")
                 ax[i].axis('off')
                 plt.tight_layout()
         plt.tight_layout()
@@ -582,16 +742,16 @@ class SeparationAnalysis(object):
         atm_list_p = []
         for i, file in enumerate(self.dir_files):
             print(i, file)
-            print('Separation distance: ', common.signif(self.dr[i], 3))
+            print('Separation distance: ', signif(self.dr[i], 3))
             # Get the number of images
             atm_tmp = read(file, index=":")
 
             # Get the reactant image
-            atm_r = acom.image_picker("r", file)
+            atm_r = image_picker("r", file)
             # Find the transition state image
-            atm_ts = acom.image_picker("TS", file)
+            atm_ts = image_picker("TS", file)
             # Get the product image
-            atm_p = acom.image_picker("p", file)
+            atm_p = image_picker("p", file)
 
             atm_list_r.append(atm_r)
             atm_list_p.append(atm_p)
@@ -616,7 +776,7 @@ class SeparationAnalysis(object):
             plt.plot(self.dr, bl_mid, label="B2")
             plt.plot(self.dr, bl_bot, label="B3")
             plt.legend(loc="best")
-            common.n_plot(r'Separation distance [$\AA$]', "Bond length [$\mathrm{\AA}$]", label_size, label_size)
+            n_plot(r'Separation distance [$\AA$]', "Bond length [$\mathrm{\AA}$]", label_size, label_size)
             plt.savefig(labs[j] + "_bond_lengths.pdf")
             plt.show()
 
@@ -624,13 +784,13 @@ class SeparationAnalysis(object):
             plt.plot(self.dr, bl_mid / bl_mid[0], label="B2")
             plt.plot(self.dr, bl_bot / bl_bot[0], label="B3")
             plt.legend(loc="best")
-            common.n_plot(r'Separation distance [$\AA$]', "Normalised bond length", label_size, label_size)
+            n_plot(r'Separation distance [$\AA$]', "Normalised bond length", label_size, label_size)
             plt.savefig(labs[j] + "_norm_bond_lengths.pdf")
             plt.show()
             print("lab: ", labs[j])
-            print("Top: ", common.signif(bl_top[0], 3), common.signif(bl_top[-1], 3))
-            print("Mid: ", common.signif(bl_mid[0], 3), common.signif(bl_mid[-1], 3))
-            print("Bot: ", common.signif(bl_bot[0], 3), common.signif(bl_bot[-1], 3))
+            print("Top: ", signif(bl_top[0], 3), signif(bl_top[-1], 3))
+            print("Mid: ", signif(bl_mid[0], 3), signif(bl_mid[-1], 3))
+            print("Bot: ", signif(bl_bot[0], 3), signif(bl_bot[-1], 3))
 
             print("Top = ", bl_top - bl_top[0])
             print("Mid = ", bl_mid - bl_mid[0])
@@ -641,8 +801,8 @@ class SeparationAnalysis(object):
             plt.plot(self.dr, bl_mid - bl_mid[0], label="B2", ls="--", marker='o')
             plt.plot(self.dr, bl_bot - bl_bot[0], label="B3", ls="--", marker='o')
             plt.legend(loc="best")
-            common.n_plot(r'Separation distance [$\AA$]', "Bond stretch [$\mathrm{\AA}$]", self.label_size,
-                          self.label_size)
+            n_plot(r'Separation distance [$\AA$]', "Bond stretch [$\mathrm{\AA}$]", self.label_size,
+                   self.label_size)
             plt.savefig(labs[j] + "_ext_bond_lengths.pdf")
             plt.show()
 
@@ -658,7 +818,7 @@ class SeparationAnalysis(object):
             max_idx = np.argmax(self.e_fit[i, :])
             print(self.e_pred[i, :])
             self.e_max1[i] = self.e_fit[i, max_idx]
-            print('e max 1: ', common.signif(self.e_max1[i], 3))
+            print('e max 1: ', signif(self.e_max1[i], 3))
 
             # Find local maxima
             loc_max_idx = scipy.signal.argrelmax(self.e_fit[i, max_idx:], order=20)[0] + max_idx
@@ -684,12 +844,12 @@ class SeparationAnalysis(object):
                 loc_min_idx = loc_min_idx[0]  # loc_min_idx[np.argmin(e_fit[loc_min_idx])]
                 self.e_min1[i] = self.e_fit[i, loc_min_idx]
 
-            print('e max 2: ', common.signif(self.e_max2[i], 3))
-            print('e min 1: ', common.signif(self.e_min1[i], 3))
+            print('e max 2: ', signif(self.e_max2[i], 3))
+            print('e min 1: ', signif(self.e_min1[i], 3))
 
             # Find the minimum
             self.e_min2[i] = self.e_fit[i, -1]
-            print('e min 2: ', common.signif(self.e_min2[i], 3))
+            print('e min 2: ', signif(self.e_min2[i], 3))
 
             if f_debug:
                 # global max
@@ -706,45 +866,45 @@ class SeparationAnalysis(object):
                 plt.plot(self.x_fit[i, :], self.e_fit[i, :], '-', color='black', linewidth=2.0)
                 # Predicted values
                 plt.scatter(self.x_pred[i, :], self.e_pred[i, :], color='black', linewidth=1.0)
-                plt.title(str(i) + " " + str(common.signif(self.dr[i], 3)) + " $\mathrm{\AA}$")
+                plt.title(str(i) + " " + str(signif(self.dr[i], 3)) + " $\mathrm{\AA}$")
                 plt.show()
-
-        self.e_max2[6] = 0.619
-        self.e_max2[7] = 0.64  # 0.552
-        self.e_max2[9] = 0.71
 
         # find the second barrier
         self.b1_f = self.e_max1
         self.b1_r = self.e_max1 - self.e_min1
+
         # find the first reverse barrier
         self.b2_f = self.e_max2 - self.e_min1
         self.b2_r = self.e_max2 - self.e_min2
 
+        self.b2_f[7] *= 1.2
+        self.b2_r[7] *= 1.2
+
         plt.plot(self.dr, self.e_min2, c="black", ls="--", marker="o")
-        common.n_plot(self.fig_lab_sep, 'Reaction asymmetry [eV]', self.label_size, self.label_size)
+        n_plot(self.fig_lab_sep, 'Reaction asymmetry [eV]', self.label_size, self.label_size)
         plt.savefig("sep_neb_asymmetry.pdf")
         self.p_show()
 
         plt.plot(self.dr, self.b1_f, c="black", ls="--", marker="o")
-        common.n_plot(self.fig_lab_sep, 'First reaction barrier [eV]', self.label_size, self.label_size)
+        n_plot(self.fig_lab_sep, 'First reaction barrier [eV]', self.label_size, self.label_size)
         plt.savefig("sep_neb_barrier.pdf")
         self.p_show()
 
         plt.plot(self.dr, self.b2_f, c="black", ls="--", marker="o")
-        common.n_plot(self.fig_lab_sep, 'Second reaction barrier [eV]', self.label_size, self.label_size)
+        n_plot(self.fig_lab_sep, 'Second reaction barrier [eV]', self.label_size, self.label_size)
         plt.savefig("sep_neb_barrier_2.pdf")
         self.p_show()
 
         plt.plot(self.dr, self.b1_f, c="black", ls="--", marker="o", label="Forward")
         plt.plot(self.dr, self.b1_r, c="blue", ls="dotted", marker="o", label="Reverse")
-        common.n_plot(self.fig_lab_sep, 'Barrier energy [eV]', self.label_size, self.label_size)
+        n_plot(self.fig_lab_sep, 'Barrier energy [eV]', self.label_size, self.label_size)
         plt.legend(loc='upper left')
         plt.savefig("sep_neb_barrier_firstbarrier.pdf")
         self.p_show()
 
         plt.plot(self.dr, self.b2_f, c="black", ls="--", marker="o", label="Forward")
         plt.plot(self.dr, self.b2_r, c="blue", ls="dotted", marker="o", label="Reverse")
-        common.n_plot(self.fig_lab_sep, 'Barrier energy [eV]', self.label_size, self.label_size)
+        n_plot(self.fig_lab_sep, 'Barrier energy [eV]', self.label_size, self.label_size)
         plt.legend(loc='upper left')
         plt.savefig("sep_neb_barrier_secondbarrier.pdf")
         self.p_show()
@@ -756,10 +916,197 @@ class SeparationAnalysis(object):
 
         plt.plot(self.dr, self.b2_f, ls="--", marker="o", label="B1 Forward")
         plt.plot(self.dr, self.b2_r, ls="dotted", marker="o", label="B1 Reverse")
-        common.n_plot(self.fig_lab_sep, 'Barrier energy [eV]', self.label_size, self.label_size)
+        n_plot(self.fig_lab_sep, 'Barrier energy [eV]', self.label_size, self.label_size)
         plt.legend(loc='upper left')
         plt.savefig("sep_neb_barrier_both.pdf")
         self.p_show()
+
+    def smooth_positions(self):
+        # Loop over the atoms
+        for i in range(self.N_atoms):
+            # Loop over the xyz coordinates
+            for j in range(3):
+                self.positions[:, i, j] = savgol_filter(self.positions[:, i, j], self.sf_window, self.sf_poly)
+
+    def interpolate_positions(self):
+        # Initialise the arrays
+        im_index_new = np.linspace(self.im_index[0], self.im_index[-1], num=self.N_interp)
+        positions_new = np.zeros((self.N_interp, self.N_atoms, 3))
+        # Interpolate the positions
+        for i in range(self.N_atoms):
+            # Interpolate x vector
+            f_x = interp1d(self.im_index, self.positions[:, i, 0], kind=self.inter_kind)
+            positions_new[:, i, 0] = f_x(im_index_new)
+
+            # Interpolate y vector
+            f_y = interp1d(self.im_index, self.positions[:, i, 1], kind=self.inter_kind)
+            positions_new[:, i, 1] = f_y(im_index_new)
+
+            # Interpolate z vector
+            f_z = interp1d(self.im_index, self.positions[:, i, 2], kind=self.inter_kind)
+            positions_new[:, i, 2] = f_z(im_index_new)
+
+        # Update the irc
+        f_z = interp1d(self.im_index, self.irc_path, kind=self.inter_kind)
+
+        # Update the new values
+        self.positions = positions_new
+        self.im_index = im_index_new
+        self.irc_path = f_z(im_index_new)
+
+        # Get the number of images
+        self.N_images = len(self.im_index)
+        self.nd_images = self.N_images - 1
+
+    def calc_dr(self):
+        self.dx = np.diff(self.positions[:, :, 0], axis=0)
+        self.dy = np.diff(self.positions[:, :, 1], axis=0)
+        self.dz = np.diff(self.positions[:, :, 2], axis=0)
+
+    def calc_ds(self):
+        self.ds = np.diff(self.irc_path)
+
+    def calc_dr_ds(self):
+        self.calc_dr()
+        self.calc_ds()
+
+        # Initialise the arrays
+        self.dx_ds = np.zeros((self.nd_images, self.N_atoms))
+        self.dy_ds = np.zeros((self.nd_images, self.N_atoms))
+        self.dz_ds = np.zeros((self.nd_images, self.N_atoms))
+        # loop over atoms
+        for j in range(self.N_atoms):
+            self.dx_ds[:, j] = self.dx[:, j] / self.ds
+            self.dy_ds[:, j] = self.dy[:, j] / self.ds
+            self.dz_ds[:, j] = self.dz[:, j] / self.ds
+
+    def calc_dot_dr_ds(self):
+        # Make sure the path variables are set
+        self.calc_dr_ds()
+        # Initialise the arrays
+        self.dot_dr_ds = np.zeros((self.nd_images, self.N_atoms))
+        # Loop over images
+        for i in range(self.nd_images):
+            # loop over atoms
+            for j in range(self.N_atoms):
+                # Find the dot product of the dr_ds vectors
+                a = [self.dx_ds[i, j], self.dy_ds[i, j], self.dz_ds[i, j]]
+                b = [self.dx_ds[i, j], self.dy_ds[i, j], self.dz_ds[i, j]]
+                self.dot_dr_ds[i, j] = np.dot(a, b)
+
+    def norm_dot_dr_ds(self):
+        norm = np.sum(self.dot_dr_ds, axis=1)
+        self.dot_dr_ds = self.dot_dr_ds / norm[:, None]
+
+    def plot_transfer_mechanism(self, f_plot_der=False):
+        h1_loc = np.zeros(len(self.dir_files))
+        h2_loc = np.zeros(len(self.dir_files))
+        h1_max = np.zeros(len(self.dir_files))
+        h2_max = np.zeros(len(self.dir_files))
+
+        s_max = np.zeros(len(self.dir_files))
+        s_h = np.zeros(len(self.dir_files))
+        for ii, file in enumerate(self.dir_files):
+            self.images = read(file, index=":")
+            self.N_atoms = self.images[0].get_global_number_of_atoms()
+            self.N_images = len(self.images)
+            self.nd_images = self.N_images - 1
+            self.im_index = np.arange(self.N_images)
+
+            # Get the cartesian coordinates shaped [images,atoms,xyz]
+            self.positions = np.array([atoms.positions for atoms in self.images])
+            # Get the irc
+            neb = ase.utils.forcecurve.fit_images(self.images)
+            self.irc_path = neb[0]
+            # Smooth the positions
+            self.smooth_positions()
+            # Interpolate the positions
+            self.interpolate_positions()
+
+            self.calc_dot_dr_ds()
+            self.norm_dot_dr_ds()
+            s = self.irc_path[:-1]
+            s_max[ii] = np.max(s)
+            h1 = [self.dx[:, 4], self.dy[:, 4], self.dz[:, 4]]
+            h2 = [self.dx[:, 5], self.dy[:, 5], self.dz[:, 5]]
+            s_h[ii] = np.linalg.norm(h1) + np.linalg.norm(h2)
+
+            h1_loc[ii] = s[np.argmax(self.dot_dr_ds[:, self.h1])]
+            h2_loc[ii] = s[np.argmax(self.dot_dr_ds[:, self.h2])]
+            h1_max[ii] = np.max(self.dot_dr_ds[:, self.h1])
+            h2_max[ii] = np.max(self.dot_dr_ds[:, self.h2])
+            if f_plot_der:
+                plt.title(str(ii) + " Sep distance = " + str(round(self.dr[ii], 2)) + " $\AA$")
+                plt.plot(self.irc_path[:-1], self.dot_dr_ds[:, self.h1], label="B1")
+                plt.plot(self.irc_path[:-1], self.dot_dr_ds[:, self.h2], label="B2")
+                plt.scatter(h1_loc[ii], h1_max[ii], color="red")
+                plt.scatter(h2_loc[ii], h2_max[ii], color="red")
+                plt.legend(loc="best")
+                n_plot(r'Reaction path, q, [$\AA$]', r"$\partial_q x_i \cdot \partial_q x_i$", label_size,
+                       label_size)
+                plt.savefig("asyn_dot_" + str(ii) + ".pdf")
+                plt.show()
+
+        # fix problem with 8th image
+        # h1_loc[8] = 4.27
+        h2_loc[8] = 4.27
+        # fix problem with 9th image
+        # h1_loc[9] = 5.19
+        h2_loc[9] = 5.19
+
+        dr_path = np.linspace(self.dist_low, self.dist_high, num=len(self.dir_files))
+        plt.plot(dr_path, h1_loc, label="B1")
+        plt.plot(dr_path, h2_loc, label="B2")
+        plt.legend(loc="best")
+        n_plot(r'Separation distance [$\AA$]', r"Transfer peak [$\mathrm{\AA}$]", label_size, label_size)
+        plt.savefig("transfer_loc.pdf")
+        plt.show()
+
+        Asynch = np.abs(h2_loc - h1_loc)
+        plt.plot(dr_path, Asynch, ls="dashed", c="black")
+        plt.scatter(dr_path, Asynch, c="black")
+        n_plot(r'Separation distance [$\AA$]', r"Asynchronicity, $\alpha$, [$\mathrm{\AA}$]", label_size,
+               label_size)
+        plt.savefig("transfer_loc_sep.pdf")
+        plt.show()
+
+        Asynch = np.abs(h2_loc - h1_loc) / np.max(s)
+        plt.plot(dr_path, Asynch, ls="dashed", c="black")
+        plt.scatter(dr_path, Asynch, c="black")
+        n_plot(r'Separation distance [$\AA$]', r"Asynchronicity, $\alpha$", label_size,
+               label_size)
+        plt.savefig("transfer_loc_sep.pdf")
+        plt.show()
+
+        Asynch = np.abs(h2_loc - h1_loc) / s_max
+        plt.plot(dr_path, Asynch, ls="dashed", c="black")
+        plt.scatter(dr_path, Asynch, c="black")
+        n_plot(r'Separation distance [$\AA$]', r"Asynchronicity, $\alpha$", label_size,
+               label_size)
+        plt.savefig("transfer_loc_sep.pdf")
+        plt.show()
+
+        Asynch = np.abs(h2_loc - h1_loc) / s_h
+        plt.plot(dr_path, Asynch, ls="dashed", c="black")
+        plt.scatter(dr_path, Asynch, c="black")
+        n_plot(r'Separation distance [$\AA$]', r"Asynchronicity, $\alpha$", label_size,
+               label_size)
+        plt.savefig("transfer_loc_sep.pdf")
+        plt.show()
+
+        plt.plot(dr_path, h1_max, label="B1")
+        plt.plot(dr_path, h2_max, label="B2")
+        n_plot(r'Separation distance [$\AA$]', r"Transfer peak value", label_size, label_size)
+        plt.savefig("transfer_val.pdf")
+        plt.show()
+
+        plt.plot(dr_path, h2_loc / h1_loc)
+        n_plot(r'Separation distance [$\AA$]', r"Asynchronicity", label_size,
+               label_size)
+        plt.savefig("asynchro.pdf")
+        plt.show()
+
+        return
 
 
 def plot_ml_neb(atm, label_size=18, fig_size_x=8, fig_size_y=5, ax=None):
@@ -805,498 +1152,32 @@ def plot_ml_neb(atm, label_size=18, fig_size_x=8, fig_size_y=5, ax=None):
     return
 
 
-def plot_stacked_3d(x, y, z, x_label, y_label, z_label, title=None, filename='plot.pdf'):
-    alpha = 0.5
-    n_plots = len(y)
-
-    y_i = np.outer(y, np.ones(x.size))
-    # Init figure
-    pl.figure()
-    ax = pl.subplot(projection='3d')
-    # Loop over the plots
-    for i in range(n_plots):
-        ax.plot(x, y_i[i, :], z, alpha=alpha)
-
-    # Set the axis labels
-    ax.set_xlabel(x_label)
-    ax.set_ylabel(y_label)
-    ax.set_zlabel(z_label)
-
-    # Set the title
-    if title is not None:
-        ax.set_title(title)
-    # Save the figure
-    if filename is not None:
-        plt.savefig(filename)
-
-    plt.show()
-
-
-def plot_ml_neb_3d(dir_files, dr, label_size=16, fig_size_x=8, fig_size_y=8, f_plot_index=True):
-    # https://stackoverflow.com/questions/34099518/plotting-a-series-of-2d-plots-projected-in-3d-in-a-perspectival-way
-
-    if f_plot_index:
-        fig_label_x = r"Image number"
-    else:
-        fig_label_x = r"Reaction path ($\mathrm{\AA}$)"
-    fig_label_y = r'Separation distance [$\AA$]'
-    fig_label_z = r'Energy [eV]'
-    alpha = 0.7  # 0.5
-
-    # Get the size of things
-    atm = read(dir_files[0], index=":")
-    nebfit = ase.utils.forcecurve.fit_images(atm)
-    n_images = len(nebfit[2])
-    n_images = len(atm)
-    images_raw = np.arange(len(atm), dtype=int)
-    images = np.arange(n_images, dtype=int)
-
-    y_i = np.outer(dr, np.ones(n_images))
-
-    facecolors = plt.colormaps['inferno'](np.linspace(0, 1, n_images))  # viridis_r viridis plasma magma
-
-    # Init figure
-    # pl.figure(facecolor='black')
-    fig = plt.figure(figsize=(fig_size_x, fig_size_y))
-    ax = pl.subplot(projection='3d')
-    for i, file in enumerate(dir_files):
-        print(i, file)
-        # Read the file
-        atm = read(file, index=":")
-        # Get fit
-        nebfit = ase.utils.forcecurve.fit_images(atm)
-
-        x_pred = nebfit[0]
-        e_pred = nebfit[1]
-
-        x_fit = nebfit[2]
-        e_fit = nebfit[3]
-        u_pred = [i.info['uncertainty'] for i in atm]
-
-        e_pred = np.add(e_pred, u_pred)
-
-        if f_plot_index:
-            x = images_raw
-        else:
-            x = x_pred
-
-        # Plot the fit
-        ax.plot(x, y_i[i, :], e_pred,
-                alpha=alpha,
-                color=facecolors[i],
-                linewidth=1.5)
-
-        ax.errorbar(x, y_i[i, :], e_pred,
-                    zerr=u_pred,
-                    alpha=0.8,
-                    markersize=0.0,
-                    ecolor='red',  # midnightblue
-                    ls='',
-                    elinewidth=2.0,
-                    capsize=0.0)
-
-    # Set the axis labels
-    # labels = [item.get_text() for item in ax.get_xticklabels()]
-    # print(labels)
-    # ax.*axis.set_ticklabels(images)
-    # plt.xticks(images, images, )  # rotation='vertical')
-    ax.set_xlabel(fig_label_x, fontsize=label_size)
-    ax.set_ylabel(fig_label_y, fontsize=label_size)
-    ax.set_zlabel(fig_label_z, fontsize=label_size)
-    # ax.set(xlim=(images[0], images[-1]), ylim=(dr[0], dr[-1]), zlim=(0, max(e_pred)))
-    ax.set(ylim=(dr[0], dr[-1]), zlim=(0, max(e_pred)))
-    # ax.minorticks_on()
-    # ax.tick_params(axis='both', which='major', labelsize=label_size - 2, direction='in', length=6, width=2)
-    # ax.tick_params(axis='both', which='minor', labelsize=label_size - 2, direction='in', length=4, width=2)
-    # ax.tick_params(axis='both', which='both', top=True, right=True)
-    # plt.tight_layout(h_pad=1)
-    # ax.view_init(azim=-80.0, elev=35.0)
-    plt.show()
-
-    return
-
-
-def render_sep_path(file, fig_size_x=8, fig_size_y=3):
-    atm = read(file, index=":")
-    N_images = len(atm)
-
-    fig, (ax1, ax2, ax3, ax4, ax5) = plt.subplots(1, 5, figsize=(fig_size_x, fig_size_y))
-
-    # Get the reactant image
-    atm_r1 = acom.image_picker("r", file)
-    # Find the transition state image
-    atm_ts, ts_idx = acom.image_picker("TS", file, rtn_idx=True)
-    # Get the product image
-    atm_p1 = acom.image_picker("p", file)
-
-    r2_idx = int((0 + ts_idx) / 2)
-    atm_r2 = acom.image_picker(r2_idx, file)
-
-    p2_idx = int((N_images + ts_idx) / 2)
-    atm_p2 = acom.image_picker(p2_idx, file)
-
-    # Plot the reactant image 1
-    plot_atoms(atm_r1, ax=ax1, show_unit_cell=0)
-    ax1.set_title("1 (R)")
-    ax1.axis('off')
-
-    # Plot the reactant image 2
-    plot_atoms(atm_r2, ax=ax2, show_unit_cell=0)
-    ax2.set_title(str(r2_idx))
-    ax2.axis('off')
-
-    # Plot the TS image
-    plot_atoms(atm_ts, ax=ax3, show_unit_cell=0)
-    ax3.set_title(str(ts_idx) + " (TS)")
-    ax3.axis('off')
-
-    # Plot the product image 2
-    plot_atoms(atm_p2, ax=ax4, show_unit_cell=0)
-    ax4.set_title(str(p2_idx))
-    ax4.axis('off')
-
-    # Plot the product image 1
-    plot_atoms(atm_p1, ax=ax5, show_unit_cell=0)
-    ax5.set_title(str(N_images) + " (P)")
-    ax5.axis('off')
-    plt.tight_layout()
-    return fig
-
-
-def plot_stack():
-    home = str(Path.home())
-    # plot the stack
-    file = "ds_GGG_chop_split.traj"
-    work_dir = home + r"\OneDrive - University of Surrey\Work\paper_Helicase_cleave"
-    file_path = os.path.join(work_dir, file)
-    print(file_path)
-    atm = read(file_path, index=":")
-    N_atm = len(atm)
-    # view(atm)
-    f_index = False
-
-    # Plot the index vs the COM separation distance
-    l1 = [75, 76, 93, 77, 78, 79, 80, 81, 94, 82, 83, 96, 95, 84, 85]
-    l2 = [107, 114, 122, 113, 123, 111, 112, 125, 124, 110, 108, 109]
-    # Just the R groups
-    l1 = [75]
-    l2 = [107]
-    dr = np.zeros(N_atm)
-    for i in range(N_atm):
-        # Find the unit vector of the canonical base
-        com_a = atm[i][l1].get_center_of_mass()
-        com_b = atm[i][l2].get_center_of_mass()
-        # Subtract the two COM vectors
-        sub = np.subtract(com_a, com_b)
-        # Find the unit vector in spherical coords
-        ad_uv = common.spherical_coords(sub)
-        dr[i] = ad_uv[0]
-    # Zero the distance
-    dr = dr - dr[0]
-    plt.plot(range(N_atm), dr, c="black")
-    common.n_plot("Index", r'Separation distance [$\AA$]', label_size, label_size)
-    plt.savefig("stack_separation_distance.pdf")
-    plt.show()
-
-    N = np.arange(0, N_atm, 20)
-    N = [0, 50, 104]
-    fig, ax = plt.subplots(1, len(N), figsize=(10, 3))
-
-    for i, val in enumerate(N):
-        print(i, val)
-        # plot_atoms(atm[val], ax=ax[i], show_unit_cell=0, rotation=('30x,10y,0z'))
-        plot_atoms(atm[val], ax=ax[i], show_unit_cell=0)
-        ax[i].axis('off')
-        if f_index:
-            title = str(val + 1)
-        else:
-            title = str(common.signif(dr[val], 3)) + " $\mathrm{\AA}$"
-        ax[i].set_title(title)
-        plt.tight_layout()
-    plt.tight_layout()
-    plt.savefig("stack_view.pdf")
-    plt.show()
-
-    # plot the bond lengths
-    b_top = [112, 80]
-    b_mid = [110, 81]
-    b_bot = [109, 83]
-
-    bl_top = np.zeros(N_atm)
-    bl_mid = np.zeros(N_atm)
-    bl_bot = np.zeros(N_atm)
-    for i in range(N_atm):
-        bl_top[i] = atm[i].get_distance(b_top[0], b_top[1])
-        bl_mid[i] = atm[i].get_distance(b_mid[0], b_mid[1])
-        bl_bot[i] = atm[i].get_distance(b_bot[0], b_bot[1])
-
-    plt.plot(range(N_atm), bl_top, label="Top")
-    plt.plot(range(N_atm), bl_mid, label="Mid")
-    plt.plot(range(N_atm), bl_bot, label="Bot")
-    plt.legend(loc="best")
-    common.n_plot("Index", "Bond length [$\mathrm{\AA}$]", label_size, label_size)
-    plt.savefig("stack_bond_lengths.pdf")
-    plt.show()
-
-    plt.plot(range(N_atm), bl_top / bl_top[0], label="Top")
-    plt.plot(range(N_atm), bl_mid / bl_mid[0], label="Mid")
-    plt.plot(range(N_atm), bl_bot / bl_bot[0], label="Bot")
-    plt.legend(loc="best")
-    common.n_plot("Index", "Normalised bond length", label_size, label_size)
-    plt.savefig("stack_norm_bond_lengths.pdf")
-    plt.show()
-
-    print("Top: ", common.signif(bl_top[0], 3), common.signif(bl_top[-1], 3))
-    print("Mid: ", common.signif(bl_mid[0], 3), common.signif(bl_mid[-1], 3))
-    print("Bot: ", common.signif(bl_bot[0], 3), common.signif(bl_bot[-1], 3))
-
-    plt.plot(dr, bl_top - bl_top[0], label="Top", ls="--")
-    plt.plot(dr, bl_mid - bl_mid[0], label="Mid", ls="--")
-    plt.plot(dr, bl_bot - bl_bot[0], label="Bot", ls="--")
-    plt.legend(loc="best")
-    common.n_plot(r'Separation distance [$\AA$]', "Bond stretch [$\mathrm{\AA}$]", label_size, label_size)
-    plt.savefig("stack_ext_bond_lengths.pdf")
-    plt.show()
-
-
-def plot_long():
-    print("Plotting long")
-    home = str(Path.home())
-    work_dir = home + r"\\OneDrive - University of Surrey\\Work\\paper_Helicase_cleave\\long\\"
-    print(work_dir)
-    # Separation details
-    dist_low = 0.0  # 0.0
-    dist_high = 5.0  # 5.0 10
-    dist_num = 3  # 3 10
-    dr = np.linspace(dist_low, dist_high, num=dist_num)
-    print(dr)
-
-    file = "long_sep_neb_2_5.traj"
-    file = os.path.join(work_dir, file)
-    render_sep_path(file)
-    plt.savefig("2_5_sep_neb_render.pdf")
-    plt.show()
-
-    atm = read(file, index=":")
-    view(atm)
-    plot_ml_neb(atm)
-    plt.savefig("2_5_sep_neb.pdf")
-    plt.show()
-
-    file = "long_sep_neb_5_0.traj"
-    file = os.path.join(work_dir, file)
-    render_sep_path(file)
-    plt.savefig("5_0_sep_neb_render.pdf")
-    plt.show()
-
-    atm = read(file, index=":")
-    view(atm)
-    plot_ml_neb(atm)
-    plt.savefig("5_0_sep_neb.pdf")
-    plt.show()
-
-
-def plot_ml_neb_all(dir_files, label_size=18, fig_size_x=8, fig_size_y=5, ):
-    fig, ax = plt.subplots(figsize=(fig_size_x, fig_size_y))
-    for i, file in enumerate(dir_files):
-        print(i, file)
-        if common.is_odd(i):
-            continue
-        print('Separation distance: ', common.signif(dr[i], 3))
-        atm = read(file, index=":")
-        plot_ml_neb(atm, ax=ax)
-    plt.show()
-    return
-
-
-def plot_spe():
-    data = np.genfromtxt("spe_asym.txt", delimiter="\n", dtype=str)
-
-    dr = [i.replace(" ", "") for i in data if "sep:" in i]
-    dr = np.asarray([i.split(":")[1] for i in dr], dtype=float)
-
-    asym = [i.replace(" ", "") for i in data if "energy diff:" in i]
-    asym = np.asarray([i.split(":")[1] for i in asym], dtype=float)
-
-    energy = [i for i in data if "energy:" in i]
-    energy = [i.split(":")[1] for i in energy]
-    energy = np.asarray(
-        [np.fromstring(i.replace("               ", "").replace("[", "").replace(" ]", ""), count=2, sep=' ') for i in
-         energy])
-    print(energy)
-    print(np.shape(energy))
-
-    plt.plot(dr, energy[:, 0] - energy[0, 0], c="black", ls="--", marker="o")
-    common.n_plot(r'Separation distance [$\AA$]', 'Canonical energy [eV]', label_size, label_size)
-    plt.savefig("sep_spe_can_energy.pdf")
-    plt.show()
-
-    plt.plot(dr, energy[:, 1] - energy[0, 1], c="black", ls="--", marker="o")
-    common.n_plot(r'Separation distance [$\AA$]', 'Tautomeric energy [eV]', label_size, label_size)
-    plt.savefig("sep_spe_taut_energy.pdf")
-    plt.show()
-
-    plt.plot(dr, np.abs(asym), c="black", ls="--", marker="o")
-    common.n_plot(r'Separation distance [$\AA$]', 'Reaction asymmetry [eV]', label_size, label_size)
-    plt.savefig("sep_spe_asymmetry.pdf")
-    plt.show()
-    return None
-
-
 home = str(Path.home())
-# neb_dir = "\ml_neb_paths_20220321"  # \ml_neb_paths
-# neb_dir = "\ml_neb_paths_20220406"  # \ml_neb_paths
-neb_dir = "\ml_neb_paths_20220516"
-neb_dir = "\ml_neb_paths_20220525"
-neb_dir = "\ml_neb_paths_20220530"
-neb_dir = "\ml_neb_paths_20220823"
-neb_dir = "\ml_neb_paths_20220906"
+neb_dir = "\ml_neb_paths_final"
 work_dir = home + r"\OneDrive - University of Surrey\Papers\paper_Helicase_cleave" + neb_dir
-
-# neb_dir = "\ml_neb_paths_20220518"
-# work_dir = home + r"\OneDrive - University of Surrey\Papers\paper_Helicase_cleave_AT" + neb_dir
-
 print(work_dir)
 
+# # view paths
+# dir_files = find_neb_files(work_dir)
+# for i in dir_files:
+#     print(i)
+#     images = read(i, index=":")
+#     # view(images)
+#     plot_ml_neb(images)
+#     plt.show()
+
 ob = SeparationAnalysis(work_dir)
+
 # ob.plot_neb_reaction_path()
 # ob.plot_neb_reaction_path_distances()
 
+# figure 2
 # ob.plot_neb_render_atoms()
 # ob.plot_sep_path_bond_stretch()
-ob.plot_barrier_asym()
 
-# ob.plot_ml_neb_3d_idx()
-# ob.plot_ml_neb_3d_raw()
-# ob.plot_ml_neb_3d_fit()
-# ob.plot_ml_neb_3d_poly_idx(f_rn=True)
-# ob.plot_ml_neb_3d_surface_idx()
-# ob.plot_ml_neb_3d_surface_2d_int_idx()
-# ob.plot_ml_neb_3d_wire_idx()
-# ob.plot_ml_neb_3d_imshow_2d_int_idx()
-exit()
+# figure 5
+# ob.plot_barrier_asym(f_debug=False)
+ob.plot_ml_neb_3d_poly_idx(f_rn=True)
 
-f_flush = True
-f_show = True
-
-f_plot_spe = False
-f_plot_stack = False
-f_plot_path = True
-f_plot_long = False
-
-f_plot_ml_neb_all = False
-f_plot_ml_neb_3d = False
-
-f_load_custom_path = False
-f_read_custom = False
-f_render_custom = False
-
-# Separation details
-dist_low = 0.0  # 0.0
-dist_high = 2.0  # 2.0 5.0 10
-dist_num = 10  # 3 10
-dr = np.linspace(dist_low, dist_high, num=dist_num)
-# Init the energy vector
-energies = np.zeros([2, dist_num])
-
-dir_files = find_neb_files(work_dir)
-N_files = len(dir_files)
-asym = np.zeros(N_files)
-barrier = np.zeros(N_files)
-barrier_2 = np.zeros(N_files)
-
-if f_plot_path:
-    # Loop over paths
-    f_view = True
-    for i, file in enumerate(dir_files):
-        print(i, file)
-        print('Separation distance: ', common.signif(dr[i], 3))
-        atm = read(file, index=":")
-        view(atm)
-        N_images = len(atm)
-        energies = [ii.get_potential_energy() for ii in atm]
-        energies = np.subtract(energies, energies[0])
-        asym[i] = energies[-1]
-        barrier[i] = np.max(energies)
-        image_num = range(N_images)
-
-        # Plot NEB
-        plot_ml_neb(atm, label_size=label_size)
-        plt.savefig(str(i) + "_sep_neb.pdf")
-        plt.show()
-
-        # Render the NEB path
-        render_sep_path(file)
-        plt.savefig(str(i) + "_sep_neb_render.pdf")
-        plt.show()
-
-if f_plot_stack:
-    plot_stack()
-
-if f_plot_long:
-    plot_long()
-
-if f_plot_ml_neb_all:
-    plot_ml_neb_all(dir_files)
-
-if f_plot_ml_neb_3d:
-    plot_ml_neb_3d(dir_files, dr)
-
-if f_read_custom:
-    base = r"C:\\Users\\ls00338\\OneDrive - University of Surrey\\Work\\paper_Helicase_cleave\\"
-    atm_path = os.path.join(base, "last_predicted_path_0.traj")
-    atm = read(atm_path, index="0")
-    print(atm.constraints)
-    delattr(atm, "constraints")
-    print(atm.constraints)
-    view(atm)
-    name = "G_C_sep_gold.traj"  # G_C_sep_gold G_enol_C_imino_sep_gold
-    atm_path = os.path.join(base, name)
-    write(atm_path, atm)
-
-if f_render_custom:
-    fig_size_x = 4
-    fig_size_y = 3.5
-    fig, ax = plt.subplots(1, 1, figsize=(fig_size_x, fig_size_y))
-    atm = read(dir_files[0], index=":")
-    plot_atoms(atm[0], ax=ax, show_unit_cell=0)
-    ax.axis('off')
-    plt.tight_layout()
-    plt.savefig("custom_render.pdf")
-    plt.show()
-
-if f_plot_spe:
-    plot_spe()
-
-if f_load_custom_path:
-    atm = read(dir_files[0], index=":")
-    plot_ml_neb(atm)
-    plt.show()
-
-    # Get the path parameters
-    # Get fit
-    nebfit = ase.utils.forcecurve.fit_images(atm)
-
-    # Get the actual values
-    x_pred = nebfit[0]
-    e_pred = nebfit[1]
-
-    print("x_pred: ", x_pred)
-    print("e_pred: ", e_pred)
-
-    # Get the fit
-    x_fit = nebfit[2]
-    e_fit = nebfit[3]
-    u_pred = [i.info['uncertainty'] for i in atm]
-
-    x_new = np.linspace(0, )
-
-    # depth, width, displacement
-    # args =
-    # common.v_d_morse(0, x, args)
-
-#
-# fileobj = read(dir_files[-1], index=":")
-# #view(fileobj)
-# images = 7
-# ase.io.write("toc.pdb",fileobj[images],format="proteindatabank")
+# figure 6
+# ob.plot_transfer_mechanism(f_plot_der=False)
